@@ -5,13 +5,65 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
 )
 
-// WLCGRecord represents a WLCG-formatted file access record
-// Format documented at: https://twiki.cern.ch/twiki/bin/view/Main/GenericFileMonitoring
+// Package-level WLCG configuration (populated from env on first use)
+var (
+	wlcgAllowedVOs   []string
+	wlcgPathPrefixes []string
+	wlcgFallback     bool
+	wlcgInitOnce     sync.Once
+)
+
+// initWLCGConfig reads env vars once. Checks COLLECTOR_ prefix first, then SHOVELER_, then defaults.
+func initWLCGConfig() {
+	wlcgInitOnce.Do(func() {
+		// Allowed VOs
+		vos := os.Getenv("COLLECTOR_AMQP_WLCG_ALLOWED_VOS")
+		if vos == "" {
+			vos = os.Getenv("SHOVELER_AMQP_WLCG_ALLOWED_VOS")
+		}
+		if vos == "" {
+			wlcgAllowedVOs = []string{"cms"}
+		} else {
+			wlcgAllowedVOs = splitTrim(vos, ",")
+		}
+
+		// Path prefixes
+		paths := os.Getenv("COLLECTOR_AMQP_WLCG_PATH_PREFIXES")
+		if paths == "" {
+			paths = os.Getenv("SHOVELER_AMQP_WLCG_PATH_PREFIXES")
+		}
+		if paths == "" {
+			wlcgPathPrefixes = []string{"/store", "/user/dteam"}
+		} else {
+			wlcgPathPrefixes = splitTrim(paths, ",")
+		}
+
+		// Fallback default
+		fb := os.Getenv("COLLECTOR_AMQP_WLCG_DEFAULT_FALLBACK")
+		if fb == "" {
+			fb = os.Getenv("SHOVELER_AMQP_WLCG_DEFAULT_FALLBACK")
+		}
+		wlcgFallback = !strings.EqualFold(fb, "false")
+	})
+}
+
+func splitTrim(s, sep string) []string {
+	parts := strings.Split(s, sep)
+	var out []string
+	for _, p := range parts {
+		if t := strings.TrimSpace(p); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
 type WLCGRecord struct {
 	SiteName               string                 `json:"site_name"`
 	Fallback               bool                   `json:"fallback"`
@@ -71,29 +123,30 @@ type WLCGRecord struct {
 	Metadata               map[string]interface{} `json:"metadata"`
 }
 
-// IsWLCGPacket determines if a record should be converted to WLCG format
-// Based on reference implementation:
-// - Path starts with /store or /user/dteam
-// - VO is "cms"
+// IsWLCGPacket now uses the package-level env config
 func IsWLCGPacket(record *CollectorRecord) bool {
-	// Check if VO is cms
-	if strings.EqualFold(record.VO, "cms") {
-		return true
+	initWLCGConfig()
+
+	for _, vo := range wlcgAllowedVOs {
+		if strings.EqualFold(record.VO, vo) {
+			return true
+		}
 	}
 
-	// Check if path starts with /store or /user/dteam
 	filename := strings.TrimSpace(record.Filename)
-	if strings.HasPrefix(filename, "/store") || strings.HasPrefix(filename, "/user/dteam") {
-		return true
+	for _, prefix := range wlcgPathPrefixes {
+		if strings.HasPrefix(filename, prefix) {
+			return true
+		}
 	}
 
 	return false
 }
 
 // ConvertToWLCG converts a CollectorRecord to WLCG format
-// Based on references/wlcg_converter.py
 func ConvertToWLCG(record *CollectorRecord) (*WLCGRecord, error) {
-	// Generate unique ID
+	initWLCGConfig()
+
 	uniqueID := uuid.New().String()
 
 	// Extract server domain from server hostname
@@ -124,7 +177,7 @@ func ConvertToWLCG(record *CollectorRecord) (*WLCGRecord, error) {
 
 	wlcg := &WLCGRecord{
 		SiteName:               record.Site,
-		Fallback:               true,
+		Fallback:               wlcgFallback,
 		UserDN:                 record.UserDN,
 		User:                   user,
 		ClientHost:             record.Host,
@@ -208,22 +261,35 @@ func (w *WLCGRecord) ToJSON() ([]byte, error) {
 	return json.Marshal(w)
 }
 
-// TPCPathCheckWLCG checks if a TPC source/destination URL should be converted to WLCG format
-// Based on references/wlcg_converter.py::tpcPathCheckWLCG
+// TPCPathCheckWLCG now uses package-level env config
 func TPCPathCheckWLCG(urlStr string) bool {
+	initWLCGConfig()
+
 	parsedURL, err := url.Parse(urlStr)
 	if err != nil {
 		return false
 	}
 	path := strings.TrimLeft(parsedURL.Path, "/")
-	return strings.HasPrefix(path, "store") || strings.HasPrefix(path, "user/dteam")
+	for _, prefix := range wlcgPathPrefixes {
+		cleanPrefix := strings.TrimLeft(prefix, "/")
+		if strings.HasPrefix(path, cleanPrefix) {
+			return true
+		}
+	}
+	return false
 }
 
-// CachePathCheckWLCG checks if a cache file path should be converted to WLCG format
-// Based on DetailedCollector.py::process_gstream
+// CachePathCheckWLCG now uses package-level env config
 func CachePathCheckWLCG(path string) bool {
+	initWLCGConfig()
+
 	cleanPath := strings.TrimSpace(path)
-	return strings.HasPrefix(cleanPath, "/store") || strings.HasPrefix(cleanPath, "/user/dteam")
+	for _, prefix := range wlcgPathPrefixes {
+		if strings.HasPrefix(cleanPath, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func renameField(m map[string]interface{}, from, to string) {
@@ -321,7 +387,6 @@ type GStreamMetadata struct {
 }
 
 // ConvertGStreamToWLCG adds WLCG metadata to a gstream event map
-// Based on references/wlcg_converter.py::ConvertGstream
 func ConvertGStreamToWLCG(event map[string]interface{}, isTPC bool) (map[string]interface{}, error) {
 	eventCopy := make(map[string]interface{})
 	for k, v := range event {
